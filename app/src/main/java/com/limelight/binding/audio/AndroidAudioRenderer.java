@@ -26,6 +26,8 @@ private static void bumpAudioPriority() {
 
 
     private final Context context;
+    // Latched once per AudioDec thread; the old per-write bump was ~200 syscalls/s.
+    private boolean audioPriorityApplied;
     private final boolean enableAudioFx;
 
     private AudioTrack track;
@@ -202,7 +204,10 @@ private static void bumpAudioPriority() {
             // This will block until the write is completed. That can cause a backlog
             // of pending audio data, so we do the above check to be able to bound
             // latency at 40 ms in that situation.
-            bumpAudioPriority();
+            if (!audioPriorityApplied) {
+                audioPriorityApplied = true;
+                bumpAudioPriority();
+            }
             track.write(audioData, 0, audioData.length);
         }
         else {

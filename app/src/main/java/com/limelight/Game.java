@@ -78,6 +78,8 @@ import android.hardware.display.DisplayManager;
 import android.hardware.input.InputManager;
 import android.media.AudioManager;
 import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -337,6 +339,10 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     private WifiManager.WifiLock highPerfWifiLock;
     private WifiManager.WifiLock lowLatencyWifiLock;
+
+    // Network the stream sockets are pinned to for the session (see bindStreamToCurrentNetwork)
+    private ConnectivityManager streamConnMgr;
+    private Network boundStreamNetwork;
 
     private boolean connectedToUsbDriverService = false;
     private ServiceConnection usbDriverServiceConnection = new ServiceConnection() {
@@ -990,6 +996,10 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 // Der Decoder erhält die jeweils aktive Oberfläche vom Container
                 decoderRenderer.setRenderTarget(streamContainer.getSurface());
 
+                // Keep the stream sockets on the network we start on, so a roam-triggered
+                // "switch to better network" or a Wi-Fi/cellular flip never moves them.
+                bindStreamToCurrentNetwork();
+
                 // Starten Sie die NvConnection
                 conn.start(new AndroidAudioRenderer(Game.this, prefConfig.playHostAudio),
                         decoderRenderer, Game.this);
@@ -1523,15 +1533,57 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         return false;
     }
 
+    // Only the pacing modes that trade latency for smoothness (or the explicit user toggle)
+    // are allowed to pull the panel down to the stream rate. The low-latency family keeps
+    // the panel at its highest refresh rate: a late frame then slips one short vsync
+    // instead of a full 16.7 ms one.
+    /**
+     * Pins this process's sockets (including the native UDP stream sockets) to the active
+     * Wi-Fi or Ethernet network for the duration of the stream. Roaming between access points
+     * of the same network keeps the same Network object, so mesh roams are unaffected; what
+     * this prevents is the OS silently moving the stream onto cellular or a different Wi-Fi
+     * network mid-session (Samsung "Switch to better Wi-Fi networks" and similar). VPN and
+     * cellular are left alone because the system default is already what we want there.
+     */
+    private void bindStreamToCurrentNetwork() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return;
+        if (prefConfig == null || !prefConfig.pinStreamNetwork) return;
+
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) return;
+
+            Network net = cm.getActiveNetwork();
+            if (net == null) return;
+
+            NetworkCapabilities caps = cm.getNetworkCapabilities(net);
+            if (caps == null || caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return;
+            if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+                    !caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) return;
+
+            if (cm.bindProcessToNetwork(net)) {
+                streamConnMgr = cm;
+                boundStreamNetwork = net;
+                LimeLog.info("Pinned stream to network " + net +
+                        (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ? " (Wi-Fi)" : " (Ethernet)"));
+            }
+        } catch (Throwable t) {
+            LimeLog.warning("Failed to pin stream to current network: " + t);
+        }
+    }
+
+    private void unbindStreamNetwork() {
+        if (boundStreamNetwork != null && streamConnMgr != null) {
+            try { streamConnMgr.bindProcessToNetwork(null); } catch (Throwable ignored) { }
+        }
+        boundStreamNetwork = null;
+        streamConnMgr = null;
+    }
+
     private boolean mayReduceRefreshRate() {
         return prefConfig.framePacing == PreferenceConfiguration.FRAME_PACING_CAP_FPS ||
                 prefConfig.framePacing == PreferenceConfiguration.FRAME_PACING_MAX_SMOOTHNESS ||
-                prefConfig.framePacing == PreferenceConfiguration.FRAME_PACING_GPU_RAW ||
-                prefConfig.framePacing == PreferenceConfiguration.FRAME_PACING_WARP ||
-                prefConfig.framePacing == PreferenceConfiguration.FRAME_PACING_WARP2 ||
-                prefConfig.framePacing == PreferenceConfiguration.FRAME_PACING_MIN_LATENCY ||
-                prefConfig.framePacing == PreferenceConfiguration.FRAME_PACING_BALANCED ||
-                prefConfig.reduceRefreshRate ;
+                prefConfig.reduceRefreshRate;
     }
 
     public boolean isOnExternalDisplay() {
@@ -1779,6 +1831,18 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
             final Surface s = getPresentSurfaceOrNull();
             if (s == null) return;
 
+            // Low-latency pacing modes must not let SurfaceFlinger drop the panel to the
+            // stream rate (Samsung/LTPO panels switch seamlessly, so even ONLY_IF_SEAMLESS
+            // would do it). Clear any hint we applied earlier and leave the panel alone.
+            if (!mayReduceRefreshRate()) {
+                if (lastAppliedSurfaceFrameRate > 0f && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    s.setFrameRate(0f, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);
+                    lastAppliedSurfaceFrameRate = 0f;
+                    LimeLog.info("Cleared Surface frame-rate hint (low-latency pacing keeps max refresh)");
+                }
+                return;
+            }
+
             // Compute desired frame-rate hint.
             //
             // For streaming we want the Surface pipeline (SF/HWC) to pace to the *stream FPS*,
@@ -1898,6 +1962,8 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         if (highPerfWifiLock != null) {
             highPerfWifiLock.release();
         }
+
+        unbindStreamNetwork();
 
         // Save zoom/pan before other cleanup
         if (prefConfig != null && prefConfig.rememberZoomPan && panZoomHandler != null) {

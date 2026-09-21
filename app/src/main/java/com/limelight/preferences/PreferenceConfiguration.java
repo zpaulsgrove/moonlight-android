@@ -161,6 +161,7 @@ public class PreferenceConfiguration {
 
     private static final String ENABLE_RUMBLE_PREF_STRING = "checkbox_enable_rumble";
     private static final String PREVENT_PACKET_LOSS_PREF_STRING = "checkbox_prevent_packet_loss";
+    private static final String PIN_STREAM_NETWORK_PREF_STRING = "checkbox_pin_stream_network";
 
     private static final String LIST_ONSCREEN_KEYBOARD_ALIGN_MODE = "list_onscreen_keyboard_align_mode";
 
@@ -280,6 +281,7 @@ public class PreferenceConfiguration {
     private static final boolean DEFAULT_FORCE_MOTION_SENSORS_FALLBACK = false;
     private static final boolean DEFAULT_ENABLE_RUMBLE = true;
     private static final boolean DEFAULT_PREVENT_PACKET_LOSS = false;
+    private static final boolean DEFAULT_PIN_STREAM_NETWORK = true;
     private static final boolean DEFAULT_GAMEPAD_ENABLE_BATTERY_REPORT = true;
     private static final boolean DEFAULT_FORCE_QWERTY = true;
     private static final boolean DEFAULT_SEND_META_ON_PHYSICAL_BACK = false;
@@ -480,6 +482,7 @@ public class PreferenceConfiguration {
     public boolean forceMotionSensorsFallbackToDevice;
     public boolean enableRumble;
     public boolean preventPacketLoss;
+    public boolean pinStreamNetwork;
 
     public boolean rememberZoomPan;
     public float zoomScale;
@@ -1175,6 +1178,7 @@ public class PreferenceConfiguration {
         config.forceMotionSensorsFallbackToDevice = prefs.getBoolean(FORCE_MOTION_SENSORS_FALLBACK_PREF_STRING, DEFAULT_FORCE_MOTION_SENSORS_FALLBACK);
         config.enableRumble = prefs.getBoolean(ENABLE_RUMBLE_PREF_STRING, DEFAULT_ENABLE_RUMBLE);
         config.preventPacketLoss = prefs.getBoolean(PREVENT_PACKET_LOSS_PREF_STRING, DEFAULT_PREVENT_PACKET_LOSS);
+        config.pinStreamNetwork = prefs.getBoolean(PIN_STREAM_NETWORK_PREF_STRING, DEFAULT_PIN_STREAM_NETWORK);
         config.snappyInput = prefs.getBoolean(SNAPPY_INPUT_PREF_STRING, DEFAULT_SNAPPY_INPUT);
         config.immediateFrameDelivery = prefs.getBoolean(IMMEDIATE_FRAME_DELIVERY_PREF_STRING, DEFAULT_IMMEDIATE_FRAME_DELIVERY);
         config.asyncDecodeEnabled = (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) && prefs.getBoolean(ASYNC_DECODE_ENABLED_PREF_STRING, DEFAULT_ASYNC_DECODE_ENABLED);

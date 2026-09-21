@@ -791,11 +791,8 @@ public final class GlUpscaleRenderer implements SurfaceTexture.OnFrameAvailableL
             }
         } catch (Throwable ignored) { }
 
-        try {
-            t.setPriority((osPrio == Process.THREAD_PRIORITY_URGENT_DISPLAY)
-                    ? (Thread.NORM_PRIORITY + 3)
-                    : (Thread.NORM_PRIORITY + 2));
-        } catch (Throwable ignored) { }
+        // NB: no Thread.setPriority() here. ART maps it back onto setpriority() and would
+        // overwrite the OS priority we just applied with a weaker value.
     }
 
     @Keep

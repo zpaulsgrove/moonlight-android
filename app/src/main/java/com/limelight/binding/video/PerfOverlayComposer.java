@@ -2,7 +2,11 @@ package com.limelight.binding.video;
 
 import android.content.Context;
 import android.net.TrafficStats;
+import android.net.wifi.WifiInfo;
+import android.net.wifi.WifiManager;
 import android.os.Process;
+
+import com.limelight.LimeLog;
 
 import com.limelight.R;
 import com.limelight.preferences.PreferenceConfiguration;
@@ -49,6 +53,13 @@ public final class PerfOverlayComposer {
 
     private volatile long lastNetDataNum = 0L;
 
+    // --- Wi-Fi link telemetry (RSSI / link speed / band) ---
+    // Read once per overlay build (1 Hz). None of these fields need the location permission.
+    private WifiManager wifiManager;
+    private boolean wifiLookupFailed;
+    private int lastWifiFrequencyMhz = 0;
+    private int lastWifiLinkSpeedMbps = 0;
+
     private long liteBlinkNextStartNs = 0L;
     private long liteBlinkEndNs = 0L;
 
@@ -57,6 +68,8 @@ public final class PerfOverlayComposer {
 
     public void reset() {
         lastNetDataNum = 0L;
+        lastWifiFrequencyMhz = 0;
+        lastWifiLinkSpeedMbps = 0;
         liteBlinkNextStartNs = 0L;
         liteBlinkEndNs = 0L;
         liteShiftNextNs = 0L;
@@ -211,6 +224,8 @@ public final class PerfOverlayComposer {
                 if (prefsSnapshot.gpuPathMode) {
                     sb.append('G');
                 }
+                sb.append("  ");
+                appendWifiInfo(context, sb, true);
             }
 
             // Server stats (host processing latency, from server) - keep at the end for readability
@@ -300,6 +315,11 @@ public final class PerfOverlayComposer {
             sb.append(context.getString(R.string.perf_overlay_netlatency,
                     (int) (rttInfo >> 32), (int) rttInfo)).append('\n');
 
+            // Wi-Fi link (lets stutter be correlated with signal / band / rate changes)
+            if (appendWifiInfo(context, sb, false)) {
+                sb.append('\n');
+            }
+
             // Host processing latency stats
             if (lastTwo.framesWithHostProcessingLatency > 0) {
                 sb.append(context.getString(R.string.perf_overlay_hostprocessinglatency,
@@ -336,6 +356,63 @@ public final class PerfOverlayComposer {
 
         final String renderedLog = sb.toString();
         return new Result(fullLog, renderedLog);
+    }
+
+    /**
+     * Appends the current Wi-Fi RSSI, link speed and band. Returns false (and appends nothing)
+     * when not on Wi-Fi or the info is unavailable. Also logs band and large link-speed changes
+     * so a logcat capture can be lined up with a stutter.
+     */
+    private boolean appendWifiInfo(final Context context, final StringBuilder sb, final boolean compact) {
+        if (wifiLookupFailed) return false;
+        try {
+            if (wifiManager == null) {
+                wifiManager = (WifiManager) context.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                if (wifiManager == null) {
+                    wifiLookupFailed = true;
+                    return false;
+                }
+            }
+
+            final WifiInfo info = wifiManager.getConnectionInfo();
+            if (info == null) {
+                return false;
+            }
+
+            final int rssi = info.getRssi();
+            final int linkMbps = info.getLinkSpeed();
+            final int freqMhz = info.getFrequency();
+            if (rssi == WifiInfo.INVALID_RSSI && linkMbps <= 0) {
+                return false;
+            }
+
+            final String band;
+            if (freqMhz >= 5925) band = "6 GHz";
+            else if (freqMhz >= 4900) band = "5 GHz";
+            else if (freqMhz > 0) band = "2.4 GHz";
+            else band = "?";
+
+            // Log the events that typically coincide with a stutter: band change (roam to a
+            // different radio) and link speed collapsing (rate adaptation after a bad roam).
+            if (lastWifiFrequencyMhz != 0 && freqMhz != 0 && freqMhz != lastWifiFrequencyMhz) {
+                LimeLog.info("Wi-Fi band/channel changed: " + lastWifiFrequencyMhz + " MHz -> " + freqMhz + " MHz (rssi " + rssi + " dBm)");
+            }
+            if (lastWifiLinkSpeedMbps > 0 && linkMbps > 0 && linkMbps * 2 <= lastWifiLinkSpeedMbps) {
+                LimeLog.info("Wi-Fi link speed dropped: " + lastWifiLinkSpeedMbps + " -> " + linkMbps + " Mbps (rssi " + rssi + " dBm)");
+            }
+            lastWifiFrequencyMhz = freqMhz;
+            lastWifiLinkSpeedMbps = linkMbps;
+
+            if (compact) {
+                sb.append("W:").append(rssi).append('/').append(linkMbps);
+            } else {
+                sb.append(context.getString(R.string.perf_overlay_wifi, rssi, linkMbps, band));
+            }
+            return true;
+        } catch (Throwable t) {
+            wifiLookupFailed = true;
+            return false;
+        }
     }
 
     // Lite pacing glyph

@@ -1190,6 +1190,12 @@
             android:summary="@string/summary_prevent_packet_loss"
             android:title="@string/title_prevent_packet_loss"
             app:iconSpaceReserved="false" />
+        <CheckBoxPreference
+            android:defaultValue="true"
+            android:key="checkbox_pin_stream_network"
+            android:summary="@string/summary_pin_stream_network"
+            android:title="@string/title_pin_stream_network"
+            app:iconSpaceReserved="false" />
     </PreferenceCategory>
 
     <PreferenceCategory

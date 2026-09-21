@@ -239,6 +239,16 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private volatile int glPresentationHintW;
     private volatile int glPresentationHintH;
     private volatile boolean stopping;
+
+    // Input-buffer wait policy: a transient shortage of decoder input buffers is never
+    // escalated into a dropped frame + IDR request. We wait in short slices until a
+    // buffer frees up, we're stopping, codec recovery is pending, or the hang detector fires.
+    private static final int INPUT_WAIT_SLICE_US = 2000;
+    private static final long INPUT_HANG_TIMEOUT_MS = 5000L;
+
+    // The thread that calls submitDecodeUnit() is the native receive thread on direct-submit
+    // decoders (all Codec2 decoders). Raise it once so it competes with the renderer.
+    private boolean inputThreadPriorityApplied;
     private CrashListener crashListener;
 
     private int consecutiveCrashCount;
@@ -1964,21 +1974,36 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         try {
             // If we don't have an input buffer index yet, fetch one now
             if (nextInputBuffer == null && nextInputBufferIndex < 0) {
-                final long t0 = System.nanoTime();
                 nextInputBufferIndex = nextInputIndex(dequeueTimeoutUs);
-                final long elapsedUs = (System.nanoTime() - t0) / 1_000L;
 
                 if (nextInputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                    if (dequeueTimeoutUs == 0) {
-                        // Non-blocking miss: reset and return, backoff handled in prefetch
-                        nextInputBufferIndex = -1;
-                        noBufferThisCall = true;
-                    } else {
-                        // Blocking path: allow a single quick retry if budget remains
-                        final int remainingUs = Math.max(0, dequeueTimeoutUs - (int) elapsedUs);
-                        final int quickBackoffUs = Math.min(remainingUs, 1000);
-                        if (quickBackoffUs > 0) {
-                            nextInputBufferIndex = nextInputIndex(quickBackoffUs);
+                    // Keep waiting in short slices. Returning here would drop the frame and
+                    // request an IDR, which is far worse than a few ms of extra input latency
+                    // (and the IDR burst tends to cause the next starvation).
+                    final int sliceUs = (dequeueTimeoutUs > 0) ? dequeueTimeoutUs : INPUT_WAIT_SLICE_US;
+                    final long waitStartMs = SystemClock.uptimeMillis();
+                    boolean timedOut = false;
+
+                    while (nextInputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER
+                            && !stopping
+                            && codecRecoveryType.get() == CR_RECOVERY_TYPE_NONE) {
+                        if ((SystemClock.uptimeMillis() - waitStartMs) >= INPUT_HANG_TIMEOUT_MS) {
+                            timedOut = true;
+                            break;
+                        }
+                        nextInputBufferIndex = nextInputIndex(sliceUs);
+                    }
+
+                    if (nextInputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                        if (timedOut) {
+                            // Let the hang detector below throw immediately.
+                            if (inputDequeueHangStartMs == 0L) {
+                                inputDequeueHangStartMs = waitStartMs;
+                            }
+                        } else {
+                            // Stopping or codec recovery pending: not an error, no IDR request.
+                            nextInputBufferIndex = -1;
+                            noBufferThisCall = true;
                         }
                     }
                 }
@@ -2662,6 +2687,13 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         if (stopping) {
             // Don't bother if we're stopping
             return MoonBridge.DR_OK;
+        }
+
+        if (!inputThreadPriorityApplied) {
+            inputThreadPriorityApplied = true;
+            try {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY);
+            } catch (Throwable ignored) { }
         }
 
         if (lastFrameNumber == 0) {
@@ -3646,9 +3678,9 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 nextInputBufferIndex = nextInputIndex(0); // 0us = non-blocking
 
                 if (nextInputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                    // Not an error: leave state reset and avoid busy-spin if caller loops.
+                    // Not an error: leave state reset. Do NOT park here: this runs on the
+                    // receive thread after every frame, and the next submit will wait anyway.
                     nextInputBufferIndex = -1;
-                    inputNonBlockingBackoff();
                     return true;
                 }
             }
@@ -3809,15 +3841,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             try { Process.setThreadPriority(tid, rendererPrio); } catch (Throwable ignored) { }
         }
 
-        // Renderer (Java hint)
-        final Thread rt = rendererThread;
-        if (rt != null) {
-            try {
-                rt.setPriority((rendererPrio == Process.THREAD_PRIORITY_URGENT_DISPLAY)
-                        ? (Thread.NORM_PRIORITY + 3)
-                        : (Thread.NORM_PRIORITY + 2));
-            } catch (Throwable ignored) { }
-        }
+        // NB: no Thread.setPriority() here. ART maps it back onto setpriority() and would
+        // overwrite the OS priority we just applied with a weaker value.
 
         // Codec async callback (OS)
         final android.os.HandlerThread cb = asyncCodec.getCallbackThread();
