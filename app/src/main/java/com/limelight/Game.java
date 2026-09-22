@@ -1533,10 +1533,6 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         return false;
     }
 
-    // Only the pacing modes that trade latency for smoothness (or the explicit user toggle)
-    // are allowed to pull the panel down to the stream rate. The low-latency family keeps
-    // the panel at its highest refresh rate: a late frame then slips one short vsync
-    // instead of a full 16.7 ms one.
     /**
      * Pins this process's sockets (including the native UDP stream sockets) to the active
      * Wi-Fi or Ethernet network for the duration of the stream. Roaming between access points
@@ -1580,10 +1576,51 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         streamConnMgr = null;
     }
 
+    // Only the pacing modes that trade latency for smoothness (or the explicit user toggle)
+    // are allowed to pull the panel down to the stream rate. The low-latency family keeps
+    // the panel at its highest refresh rate: a late frame then slips one short vsync
+    // instead of a full 16.7 ms one.
+    //
+    // Balanced is vsync-locked, so it only needs the reduction when the panel's refresh
+    // rate is not an integer multiple of the stream fps (90 Hz / 60 fps would otherwise
+    // alternate 1 and 2 vsyncs per frame). On a 120 Hz panel with a 60 fps stream it keeps
+    // the full refresh rate.
     private boolean mayReduceRefreshRate() {
         return prefConfig.framePacing == PreferenceConfiguration.FRAME_PACING_CAP_FPS ||
                 prefConfig.framePacing == PreferenceConfiguration.FRAME_PACING_MAX_SMOOTHNESS ||
+                (prefConfig.framePacing == PreferenceConfiguration.FRAME_PACING_BALANCED &&
+                        balancedNeedsRefreshReduction()) ||
                 prefConfig.reduceRefreshRate;
+    }
+
+    // Cached per activity: the display's maximum refresh rate does not change mid-session.
+    private Boolean balancedRefreshReductionCache;
+
+    private boolean balancedNeedsRefreshReduction() {
+        if (balancedRefreshReductionCache != null) {
+            return balancedRefreshReductionCache;
+        }
+
+        boolean needsReduction = true; // unknown display: keep the historical behaviour
+        try {
+            final float fps = prefConfig.fps;
+            if (fps > 0f && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                float maxHz = 0f;
+                Display display = getActiveDisplay(Game.this, prefConfig);
+                if (display != null) {
+                    for (Display.Mode m : display.getSupportedModes()) {
+                        maxHz = Math.max(maxHz, m.getRefreshRate());
+                    }
+                }
+                if (maxHz > 0f) {
+                    final float ratio = maxHz / fps;
+                    needsReduction = Math.abs(ratio - Math.round(ratio)) > 0.05f;
+                }
+            }
+        } catch (Throwable ignored) { }
+
+        balancedRefreshReductionCache = needsReduction;
+        return needsReduction;
     }
 
     public boolean isOnExternalDisplay() {

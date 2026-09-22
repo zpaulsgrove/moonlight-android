@@ -240,10 +240,16 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private volatile int glPresentationHintH;
     private volatile boolean stopping;
 
-    // Input-buffer wait policy: a transient shortage of decoder input buffers is never
-    // escalated into a dropped frame + IDR request. We wait in short slices until a
-    // buffer frees up, we're stopping, codec recovery is pending, or the hang detector fires.
+    // Input-buffer wait policy: a transient shortage of decoder input buffers is not
+    // escalated into a dropped frame + IDR request. We wait in short slices for up to
+    // ~INPUT_WAIT_FRAME_PERIODS frame periods (see getInputWaitBudgetMs), long enough to
+    // ride out a decoder hiccup but short enough that the kernel socket buffer (clamped
+    // to a few hundred KB by rmem_max) does not overflow while the receive thread is parked.
+    // Only after that budget do we give up on the frame; the hang detector throws when
+    // consecutive give-ups span INPUT_HANG_TIMEOUT_MS.
     private static final int INPUT_WAIT_SLICE_US = 2000;
+    private static final float INPUT_WAIT_FRAME_PERIODS = 3f;
+    private static final long INPUT_WAIT_MIN_BUDGET_MS = 20L;
     private static final long INPUT_HANG_TIMEOUT_MS = 5000L;
 
     // The thread that calls submitDecodeUnit() is the native receive thread on direct-submit
@@ -1977,35 +1983,31 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 nextInputBufferIndex = nextInputIndex(dequeueTimeoutUs);
 
                 if (nextInputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                    // Keep waiting in short slices. Returning here would drop the frame and
-                    // request an IDR, which is far worse than a few ms of extra input latency
-                    // (and the IDR burst tends to cause the next starvation).
+                    // Keep waiting in short slices, bounded to a few frame periods. Giving up
+                    // after a single 2-4 ms miss drops the frame and requests an IDR, and the
+                    // IDR burst tends to cause the next starvation; waiting much longer parks
+                    // the receive thread while the kernel socket buffer overflows.
                     final int sliceUs = (dequeueTimeoutUs > 0) ? dequeueTimeoutUs : INPUT_WAIT_SLICE_US;
+                    final long budgetMs = getInputWaitBudgetMs();
                     final long waitStartMs = SystemClock.uptimeMillis();
-                    boolean timedOut = false;
 
                     while (nextInputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER
                             && !stopping
-                            && codecRecoveryType.get() == CR_RECOVERY_TYPE_NONE) {
-                        if ((SystemClock.uptimeMillis() - waitStartMs) >= INPUT_HANG_TIMEOUT_MS) {
-                            timedOut = true;
-                            break;
-                        }
+                            && codecRecoveryType.get() == CR_RECOVERY_TYPE_NONE
+                            && (SystemClock.uptimeMillis() - waitStartMs) < budgetMs) {
                         nextInputBufferIndex = nextInputIndex(sliceUs);
                     }
 
-                    if (nextInputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                        if (timedOut) {
-                            // Let the hang detector below throw immediately.
-                            if (inputDequeueHangStartMs == 0L) {
-                                inputDequeueHangStartMs = waitStartMs;
-                            }
-                        } else {
-                            // Stopping or codec recovery pending: not an error, no IDR request.
-                            nextInputBufferIndex = -1;
-                            noBufferThisCall = true;
-                        }
+                    if (nextInputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER
+                            && (stopping || codecRecoveryType.get() != CR_RECOVERY_TYPE_NONE)) {
+                        // Stopping or codec recovery pending: not an error, no IDR request.
+                        nextInputBufferIndex = -1;
+                        noBufferThisCall = true;
                     }
+                    // Budget exhausted: fall through to the hang detector below. It returns
+                    // false (caller requests an IDR) and throws only once consecutive
+                    // give-ups have spanned INPUT_HANG_TIMEOUT_MS. If a decoder exception has
+                    // already been recorded it returns false right away instead of looping.
                 }
             }
 
@@ -2085,7 +2087,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
             if (inputDequeueHangStartMs == 0L) {
                 inputDequeueHangStartMs = nowMs;
-            } else if ((nowMs - inputDequeueHangStartMs) >= 5000 && initialException == null) {
+            } else if ((nowMs - inputDequeueHangStartMs) >= INPUT_HANG_TIMEOUT_MS && initialException == null) {
                 DecoderHungException decoderHungException =
                         new DecoderHungException((int) (nowMs - inputDequeueHangStartMs));
                 if (!coldCfg.reportedCrash) {
@@ -3743,13 +3745,23 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
 
     // Derive input dequeue timeout from the *effective* policy, not from pacing-profile flags.
+    private float getWantedFps() {
+        final PreferenceConfiguration p = prefs;
+        return (p != null && p.fps > 0) ? (float) p.fps :
+                ((refreshRateHz > 1f) ? refreshRateHz : ((refreshRate > 0) ? (float) refreshRate : 60f));
+    }
+
+    // Longest we hold the submitting thread waiting for an input buffer before giving up
+    // on this frame: ~3 frame periods (50 ms @ 60 fps, 25 ms @ 120 fps), never below 20 ms.
+    private long getInputWaitBudgetMs() {
+        final float fps = getWantedFps();
+        final long budget = Math.round((INPUT_WAIT_FRAME_PERIODS * 1000f) / Math.max(1f, fps));
+        return Math.max(INPUT_WAIT_MIN_BUDGET_MS, budget);
+    }
+
     private int getInputDequeueTimeoutUs() {
         final PreferenceConfiguration p = prefs;
-
-        final float wantedFps =
-                (p != null && p.fps > 0) ? (float) p.fps :
-                        ((refreshRateHz > 1f) ? refreshRateHz : ((refreshRate > 0) ? (float) refreshRate : 60f));
-
+        final float wantedFps = getWantedFps();
         final boolean immediate = (p != null && p.immediateFrameDelivery);
 
         if (immediate) {
